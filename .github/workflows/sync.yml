@@ -1,0 +1,42 @@
+name: Sync
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 0 * * 0"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.25.6
+
+      - name: Build
+        run: |
+          go run cmd/sync/main.go
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "sync: auto-update packages"
+          branch: auto-build-output
+          base: main
+          title: "Sync: auto-update packages"
+          body: |
+            - Triggered by ${{ github.sha }}
