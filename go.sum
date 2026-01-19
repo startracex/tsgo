@@ -1,0 +1,4 @@
+github.com/startracex/go-pub v0.0.0-20251012180452-cce541aafcd7 h1:+V8zPmgo6zZwglChOM3xu5Kbb6jxk7zDCt1WBKVWuJM=
+github.com/startracex/go-pub v0.0.0-20251012180452-cce541aafcd7/go.mod h1:1Ie5q+FqFN7XEdfI1hAvYTs0ZPHECU2c1SzpGX0WV7w=
+golang.org/x/mod v0.32.0 h1:9F4d3PHLljb6x//jOyokMv3eX+YDeepZSEo3mFJy93c=
+golang.org/x/mod v0.32.0/go.mod h1:SgipZ/3h2Ci89DlEtEXWUk/HteuRin+HHhN+WbNhguU=
