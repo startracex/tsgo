@@ -1,0 +1,39 @@
+package contentmappertest
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/startracex/tsgo/pkg/contentmapper"
+	"github.com/startracex/tsgo/pkg/core"
+	"github.com/startracex/tsgo/pkg/json"
+	"github.com/startracex/tsgo/pkg/spanmap"
+)
+
+type supplementalDiagnosticsHandler struct{ noNotifications }
+
+func (supplementalDiagnosticsHandler) HandleRequest(ctx context.Context, method string, params json.Value) (any, error) {
+	switch method {
+	case contentmapper.MethodInitialize:
+		return initializeResult("mapper"), nil
+	case contentmapper.MethodTransform:
+		var p contentmapper.TransformParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		const prefix = "missingSupplementalGlobal;\n"
+		mappings := spanmap.New([]spanmap.Segment{{
+			VirtualStart:	core.TextPos(len(prefix)),
+			VirtualEnd:	core.TextPos(len(prefix) + len(p.Content)),
+			OriginalEnd:	core.TextPos(len(p.Content)),
+			Kind:		spanmap.KindVerbatim,
+			Features:	spanmap.FeatureAll,
+		}}).Tuples()
+		return contentmapper.TransformResult{
+			Text:	"export {};", Extension: ".ts",
+			Supplemental:	[]contentmapper.SupplementalOutput{{Text: prefix + p.Content, Extension: ".ts", Mappings: mappings}},
+		}, nil
+	default:
+		return nil, fmt.Errorf("contentmappertest: unexpected method %q", method)
+	}
+}

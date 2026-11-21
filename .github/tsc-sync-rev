@@ -1,0 +1,6 @@
+# microsoft/TypeScript inputs published into pkg/.
+# testdata and cmd are not part of the sync.
+internal 8ee74b9393559c76ad25de754da586ec5e0c6603
+go.mod cf6c847268a5773f9ed7f40255e9902b3a8b7ad6
+go.sum 5570ad7f447d0fec3c696bd8b94cd19d2ed5cd26
+LICENSE edc24fd6e14090696ed6e30031e2ab346733e898
