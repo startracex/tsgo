@@ -1,0 +1,321 @@
+package lsp_test
+
+import (
+	"context"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/startracex/tsgo/pkg/bundled"
+	"github.com/startracex/tsgo/pkg/lsp"
+	"github.com/startracex/tsgo/pkg/lsp/lsproto"
+	"github.com/startracex/tsgo/pkg/testutil/contentmappertest"
+	"github.com/startracex/tsgo/pkg/testutil/lsptestutil"
+	"github.com/startracex/tsgo/pkg/tspath"
+	"github.com/startracex/tsgo/pkg/vfs/vfstest"
+	"gotest.tools/v3/assert"
+)
+
+func stringSlice(values ...string) *[]string	{ return &values }
+
+func TestSetContentMapperContributionsBeforeDidOpen(t *testing.T) {
+	t.Parallel()
+	if !bundled.Embedded {
+		t.Skip("bundled files are not embedded")
+	}
+
+	const component = `<component name="ProfileCard">
+<template><h1>{{ title }}</h1></template>
+<script lang="ts">
+export const title = "Profile";
+</script>`
+	files := map[string]string{
+		"/home/project/tsconfig.json": `{
+			"compilerOptions": { "target": "es2020", "module": "esnext", "moduleResolution": "bundler", "strict": true },
+			"contentMappers": [ { "package": "mapper", "extensions": [".vue"], "include": ["*.vue"] } ]
+		}`,
+		"/home/project/node_modules/mapper/package.json":	contentmappertest.PackageJSON(contentmappertest.ComponentMapper),
+		"/home/project/ProfileCard.vue":			component,
+	}
+
+	var mu sync.Mutex
+	var registrations []*lsproto.Registration
+	var unregistrations []*lsproto.Unregistration
+	unregisteredSignal := make(chan struct{}, 1)
+	onServerRequest := func(_ context.Context, req *lsproto.RequestMessage) *lsproto.ResponseMessage {
+		switch req.Method {
+		case lsproto.MethodWorkspaceConfiguration:
+			return &lsproto.ResponseMessage{ID: req.ID, JSONRPC: req.JSONRPC, Result: []any{nil, nil, nil, nil}}
+		case lsproto.MethodClientRegisterCapability:
+			params, err := req.UnmarshalParams[*lsproto.RegistrationParams]()
+			assert.NilError(t, err)
+			mu.Lock()
+			registrations = append(registrations, params.Registrations...)
+			mu.Unlock()
+			return &lsproto.ResponseMessage{ID: req.ID, JSONRPC: req.JSONRPC, Result: lsproto.Null{}}
+		case lsproto.MethodClientUnregisterCapability:
+			params, err := req.UnmarshalParams[*lsproto.UnregistrationParams]()
+			assert.NilError(t, err)
+			mu.Lock()
+			unregistrations = append(unregistrations, params.Unregisterations...)
+			mu.Unlock()
+			unregisteredSignal <- struct{}{}
+			return &lsproto.ResponseMessage{ID: req.ID, JSONRPC: req.JSONRPC, Result: lsproto.Null{}}
+		default:
+			return nil
+		}
+	}
+
+	fs := bundled.WrapFS(vfstest.FromMap(files, tspath.CaseInsensitive))
+	client, closeClient := lsptestutil.NewLSPClient(t, lsp.ServerOptions{
+		Err:			io.Discard,
+		Cwd:			"/home/project",
+		FS:			fs,
+		DefaultLibraryPath:	bundled.LibPath(),
+		Spawn:			contentmappertest.NewSpawner().Spawn,
+	}, onServerRequest)
+	t.Cleanup(func() { _ = closeClient() })
+
+	caps := &lsproto.ClientCapabilities{
+		Workspace: &lsproto.WorkspaceClientCapabilities{
+			FileOperations: &lsproto.FileOperationClientCapabilities{
+				DynamicRegistration:	new(true),
+				WillRename:		new(true),
+			},
+		},
+		TextDocument: &lsproto.TextDocumentClientCapabilities{
+			Filters:		&lsproto.TextDocumentFilterClientCapabilities{RelativePatternSupport: new(true)},
+			Synchronization:	&lsproto.TextDocumentSyncClientCapabilities{DynamicRegistration: new(true)},
+			DocumentSymbol:		&lsproto.DocumentSymbolClientCapabilities{DynamicRegistration: new(true)},
+			FoldingRange:		&lsproto.FoldingRangeClientCapabilities{DynamicRegistration: new(true)},
+			SelectionRange:		&lsproto.SelectionRangeClientCapabilities{DynamicRegistration: new(true)},
+			InlayHint:		&lsproto.InlayHintClientCapabilities{DynamicRegistration: new(true)},
+			CodeLens:		&lsproto.CodeLensClientCapabilities{DynamicRegistration: new(true)},
+			CodeAction:		&lsproto.CodeActionClientCapabilities{DynamicRegistration: new(true)},
+			Formatting:		&lsproto.DocumentFormattingClientCapabilities{DynamicRegistration: new(true)},
+			RangeFormatting:	&lsproto.DocumentRangeFormattingClientCapabilities{DynamicRegistration: new(true)},
+			OnTypeFormatting: &lsproto.DocumentOnTypeFormattingClientCapabilities{
+				DynamicRegistration: new(true),
+			},
+			LinkedEditingRange:	&lsproto.LinkedEditingRangeClientCapabilities{DynamicRegistration: new(true)},
+			CallHierarchy:		&lsproto.CallHierarchyClientCapabilities{DynamicRegistration: new(true)},
+			SemanticTokens: &lsproto.SemanticTokensClientCapabilities{
+				DynamicRegistration:	new(true),
+				Requests:		&lsproto.ClientSemanticTokensRequestOptions{},
+				TokenTypes:		[]string{},
+				TokenModifiers:		[]string{},
+				Formats:		[]lsproto.TokenFormat{lsproto.TokenFormatRelative},
+			},
+		},
+	}
+	initMsg, _, ok := client.SendRequest(t, lsproto.InitializeInfo, &lsproto.InitializeParams{
+		Capabilities:	caps,
+		RootUri:	lsproto.DocumentUriOrNull{DocumentUri: new(lsproto.DocumentUri("file:///home/project"))},
+		InitializationOptions: &lsproto.InitializationOptionsOrNull{InitializationOptions: &lsproto.InitializationOptions{
+			RunExternalCode: new(true),
+		}},
+	})
+	assert.Assert(t, ok && initMsg.AsResponse().Error == nil, "initialize failed")
+	client.SendNotification(t, lsproto.InitializedInfo, &lsproto.InitializedParams{})
+	<-client.Server.InitComplete()
+
+	uri := lsproto.DocumentUri("file:///home/project/ProfileCard.vue")
+	msg, _, ok := client.SendRequest(t, lsproto.CustomSetContentMapperContributionsInfo, &lsproto.SetContentMapperContributionsParams{
+		OpenDocuments:	[]lsproto.TextDocumentIdentifier{{Uri: uri}},
+		Contributions: []*lsproto.ContentMapperContribution{{
+			ContributorId:	"test",
+			Extensions:	stringSlice(".vue", ".svelte"),
+		}},
+	})
+	assert.Assert(t, ok && msg.AsResponse().Error == nil)
+
+	mu.Lock()
+	registered := append([]*lsproto.Registration(nil), registrations...)
+	mu.Unlock()
+	assert.Assert(t, len(registered) > 0, "expected dynamic registrations")
+	expectedMapperRegistrations := map[string]bool{
+		"content-mapper-did-open":		false,
+		"content-mapper-did-change":		false,
+		"content-mapper-did-close":		false,
+		"content-mapper-semantic-tokens":	false,
+		"content-mapper-document-symbol":	false,
+		"content-mapper-folding-range":		false,
+		"content-mapper-selection-range":	false,
+		"content-mapper-inlay-hint":		false,
+		"content-mapper-code-lens":		false,
+		"content-mapper-code-action":		false,
+		"content-mapper-formatting":		false,
+		"content-mapper-range-formatting":	false,
+		"content-mapper-on-type-formatting":	false,
+		"content-mapper-linked-editing":	false,
+		"content-mapper-call-hierarchy":	false,
+		"content-mapper-will-rename-files":	false,
+	}
+	for _, registration := range registered {
+		if _, expected := expectedMapperRegistrations[registration.Id]; !expected {
+			assert.Assert(t, !strings.HasPrefix(registration.Id, "content-mapper-"), "unexpected unsupported content mapper registration %q", registration.Id)
+		} else {
+			expectedMapperRegistrations[registration.Id] = true
+		}
+		if registration.Id == "content-mapper-did-open" {
+			assert.Assert(t, registration.RegisterOptions != nil && registration.RegisterOptions.TextDocumentDidOpen != nil)
+			selector := registration.RegisterOptions.TextDocumentDidOpen.DocumentSelector.DocumentSelector
+			assert.Assert(t, selector != nil && len(*selector) == 1)
+			pattern := (*selector)[0].Pattern.Pattern.RelativePattern
+			assert.Assert(t, pattern != nil)
+			assert.Equal(t, string(*pattern.BaseUri.URI), "file:///home/project")
+			assert.Equal(t, pattern.Pattern, "*.vue")
+		}
+		if registration.Id == "content-mapper-semantic-tokens" {
+			assert.Assert(t, registration.RegisterOptions != nil && registration.RegisterOptions.TextDocumentSemanticTokens != nil)
+			selector := registration.RegisterOptions.TextDocumentSemanticTokens.DocumentSelector.DocumentSelector
+			assert.Assert(t, selector != nil && len(*selector) == 1)
+			pattern := (*selector)[0].Pattern.Pattern.RelativePattern
+			assert.Assert(t, pattern != nil)
+			assert.Equal(t, string(*pattern.BaseUri.URI), "file:///home/project")
+			assert.Equal(t, pattern.Pattern, "*.vue")
+		}
+		if registration.Id == "content-mapper-code-action" {
+			assert.Assert(t, registration.RegisterOptions != nil && registration.RegisterOptions.TextDocumentCodeAction != nil)
+			assert.DeepEqual(t, *registration.RegisterOptions.TextDocumentCodeAction.CodeActionKinds, expectedCodeActionKinds())
+		}
+		if registration.Id == "content-mapper-will-rename-files" {
+			// Rename filters deliberately cover the whole extension, even for narrowed selectors.
+			filters := registration.RegisterOptions.WorkspaceWillRenameFiles.Filters
+			assert.Equal(t, len(filters), 1)
+			assert.Equal(t, filters[0].Pattern.Glob, "**/*.vue")
+		}
+	}
+	for id, found := range expectedMapperRegistrations {
+		assert.Assert(t, found, "expected %s registration for .vue", id)
+	}
+
+	client.SendNotification(t, lsproto.TextDocumentDidOpenInfo, &lsproto.DidOpenTextDocumentParams{
+		TextDocument: &lsproto.TextDocumentItem{Uri: uri, LanguageId: "vue", Version: 1, Text: component},
+	})
+	hoverMsg, hover, ok := client.SendRequest(t, lsproto.TextDocumentHoverInfo, &lsproto.HoverParams{
+		TextDocument:	lsproto.TextDocumentIdentifier{Uri: uri},
+		Position:	lsproto.Position{Line: 3, Character: 15},
+	})
+	assert.Assert(t, ok && hoverMsg.AsResponse().Error == nil)
+	assert.Assert(t, hover.Hover != nil, "expected hover after first foreign didOpen")
+
+	assert.NilError(t, fs.WriteFile("/home/project/tsconfig.json", `{
+		"compilerOptions": { "target": "es2020", "module": "esnext", "moduleResolution": "bundler", "strict": true }
+	}`))
+	client.SendNotification(t, lsproto.WorkspaceDidChangeWatchedFilesInfo, &lsproto.DidChangeWatchedFilesParams{
+		Changes: []*lsproto.FileEvent{{Uri: "file:///home/project/tsconfig.json", Type: lsproto.FileChangeTypeChanged}},
+	})
+	hoverMsg, hover, _ = client.SendRequest(t, lsproto.TextDocumentHoverInfo, &lsproto.HoverParams{
+		TextDocument:	lsproto.TextDocumentIdentifier{Uri: uri},
+		Position:	lsproto.Position{Line: 3, Character: 15},
+	})
+	assert.Assert(t, hoverMsg != nil && hoverMsg.AsResponse().Error == nil, "request before didClose should return a null result")
+	assert.Assert(t, hover.Hover == nil)
+	diagnosticMsg, diagnostics, ok := client.SendRequest(t, lsproto.TextDocumentDiagnosticInfo, &lsproto.DocumentDiagnosticParams{
+		TextDocument: lsproto.TextDocumentIdentifier{Uri: uri},
+	})
+	assert.Assert(t, ok && diagnosticMsg.AsResponse().Error == nil, "diagnostics before didClose should return an empty report")
+	assert.Assert(t, diagnostics.FullDocumentDiagnosticReport != nil)
+	assert.Equal(t, len(diagnostics.FullDocumentDiagnosticReport.Items), 0)
+	completionMsg, completion, ok := client.SendRequest(t, lsproto.TextDocumentCompletionInfo, &lsproto.CompletionParams{
+		TextDocument:	lsproto.TextDocumentIdentifier{Uri: uri},
+		Position:	lsproto.Position{Line: 3, Character: 15},
+	})
+	assert.Assert(t, ok && completionMsg.AsResponse().Error == nil)
+	assert.Assert(t, completion.Items == nil && completion.List == nil)
+	referencesMsg, references, ok := client.SendRequest(t, lsproto.TextDocumentReferencesInfo, &lsproto.ReferenceParams{
+		TextDocument:	lsproto.TextDocumentIdentifier{Uri: uri},
+		Position:	lsproto.Position{Line: 3, Character: 15},
+		Context:	&lsproto.ReferenceContext{IncludeDeclaration: true},
+	})
+	assert.Assert(t, ok && referencesMsg.AsResponse().Error == nil)
+	assert.Assert(t, references.Locations == nil)
+	renameMsg, rename, ok := client.SendRequest(t, lsproto.TextDocumentRenameInfo, &lsproto.RenameParams{
+		TextDocument:	lsproto.TextDocumentIdentifier{Uri: uri},
+		Position:	lsproto.Position{Line: 3, Character: 15},
+		NewName:	"renamed",
+	})
+	assert.Assert(t, ok && renameMsg.AsResponse().Error == nil)
+	assert.Assert(t, rename.WorkspaceEdit == nil)
+	textDocument := lsproto.TextDocumentIdentifier{Uri: uri}
+	position := lsproto.Position{Line: 3, Character: 15}
+	range_ := lsproto.Range{Start: position, End: position}
+	options := &lsproto.FormattingOptions{TabSize: 4, InsertSpaces: true}
+	item := &lsproto.CallHierarchyItem{
+		Name:	"stale", Kind: lsproto.SymbolKindFunction, Uri: uri, Range: range_, SelectionRange: range_,
+	}
+	for _, request := range []struct {
+		method	lsproto.Method
+		params	any
+	}{
+		{lsproto.MethodTextDocumentSignatureHelp, &lsproto.SignatureHelpParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentDefinition, &lsproto.DefinitionParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentTypeDefinition, &lsproto.TypeDefinitionParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentImplementation, &lsproto.ImplementationParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentDocumentHighlight, &lsproto.DocumentHighlightParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentCodeAction, &lsproto.CodeActionParams{
+			TextDocument:	textDocument, Range: range_, Context: &lsproto.CodeActionContext{Diagnostics: []*lsproto.Diagnostic{}},
+		}},
+		{lsproto.MethodTextDocumentSemanticTokensFull, &lsproto.SemanticTokensParams{TextDocument: textDocument}},
+		{lsproto.MethodTextDocumentSemanticTokensRange, &lsproto.SemanticTokensRangeParams{TextDocument: textDocument, Range: range_}},
+		{lsproto.MethodTextDocumentDocumentSymbol, &lsproto.DocumentSymbolParams{TextDocument: textDocument}},
+		{lsproto.MethodTextDocumentFoldingRange, &lsproto.FoldingRangeParams{TextDocument: textDocument}},
+		{lsproto.MethodTextDocumentSelectionRange, &lsproto.SelectionRangeParams{TextDocument: textDocument, Positions: []lsproto.Position{position}}},
+		{lsproto.MethodTextDocumentInlayHint, &lsproto.InlayHintParams{TextDocument: textDocument, Range: range_}},
+		{lsproto.MethodTextDocumentCodeLens, &lsproto.CodeLensParams{TextDocument: textDocument}},
+		{lsproto.MethodTextDocumentFormatting, &lsproto.DocumentFormattingParams{TextDocument: textDocument, Options: options}},
+		{lsproto.MethodTextDocumentRangeFormatting, &lsproto.DocumentRangeFormattingParams{TextDocument: textDocument, Range: range_, Options: options}},
+		{lsproto.MethodTextDocumentOnTypeFormatting, &lsproto.DocumentOnTypeFormattingParams{TextDocument: textDocument, Position: position, Ch: ";", Options: options}},
+		{lsproto.MethodTextDocumentLinkedEditingRange, &lsproto.LinkedEditingRangeParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentPrepareCallHierarchy, &lsproto.CallHierarchyPrepareParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodTextDocumentPrepareRename, &lsproto.PrepareRenameParams{TextDocument: textDocument, Position: position}},
+		{lsproto.MethodCallHierarchyIncomingCalls, &lsproto.CallHierarchyIncomingCallsParams{Item: item}},
+		{lsproto.MethodCallHierarchyOutgoingCalls, &lsproto.CallHierarchyOutgoingCallsParams{Item: item}},
+		{lsproto.MethodWorkspaceWillRenameFiles, &lsproto.RenameFilesParams{
+			Files: []*lsproto.FileRename{{OldUri: uri, NewUri: "file:///home/project/Renamed.vue"}},
+		}},
+	} {
+		response, result, ok := client.SendRequest(t, lsproto.RequestInfo[any, any]{Method: request.method}, request.params)
+		assert.Assert(t, response != nil)
+		assert.Assert(t, response.AsResponse().Error == nil, "%s: expected null fallback, got %v", request.method, response.AsResponse().Error)
+		assert.Assert(t, ok)
+		assert.Assert(t, result == nil, "%s: expected null fallback, got %v", request.method, result)
+	}
+	staleCompletionItem := &lsproto.CompletionItem{
+		Label:	"stale", Data: &lsproto.CompletionItemData{FileName: "/home/project/ProfileCard.vue", Position: 0, Name: "stale"},
+	}
+	completionResolveMsg, completionItem, resolveOK := client.SendRequest(t, lsproto.CompletionItemResolveInfo, staleCompletionItem)
+	assert.Assert(t, completionResolveMsg != nil && completionResolveMsg.AsResponse().Error == nil)
+	assert.Assert(t, resolveOK)
+	assert.DeepEqual(t, completionItem, staleCompletionItem)
+	codeLensMsg, _, _ := client.SendRequest(t, lsproto.CodeLensResolveInfo, &lsproto.CodeLens{
+		Range:	range_, Data: &lsproto.CodeLensData{Uri: uri, Kind: "references", Position: 0},
+	})
+	assert.Assert(t, codeLensMsg != nil && codeLensMsg.AsResponse().Error != nil)
+	assert.Equal(t, codeLensMsg.AsResponse().Error.Code, int32(lsproto.ErrorCodeContentModified))
+	<-unregisteredSignal
+	mu.Lock()
+	unregistered := append([]*lsproto.Unregistration(nil), unregistrations...)
+	mu.Unlock()
+	assert.Assert(t, len(unregistered) > 0, "expected dynamic unregistration")
+	expectedUnregistrations := make(map[string]bool, len(expectedMapperRegistrations))
+	for id := range expectedMapperRegistrations {
+		expectedUnregistrations[id] = false
+	}
+	for _, unregistration := range unregistered {
+		if _, expected := expectedUnregistrations[unregistration.Id]; !expected {
+			assert.Assert(t, !strings.HasPrefix(unregistration.Id, "content-mapper-"), "unexpected unsupported content mapper unregistration %q", unregistration.Id)
+		} else {
+			expectedUnregistrations[unregistration.Id] = true
+		}
+	}
+	for id, found := range expectedUnregistrations {
+		assert.Assert(t, found, "expected %s unregistration", id)
+	}
+
+	client.SendNotification(t, lsproto.TextDocumentDidCloseInfo, &lsproto.DidCloseTextDocumentParams{
+		TextDocument: lsproto.TextDocumentIdentifier{Uri: uri},
+	})
+}

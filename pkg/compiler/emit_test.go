@@ -1,0 +1,221 @@
+package compiler_test
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/startracex/tsgo/pkg/bundled"
+	"github.com/startracex/tsgo/pkg/compiler"
+	"github.com/startracex/tsgo/pkg/core"
+	"github.com/startracex/tsgo/pkg/tsoptions"
+	"github.com/startracex/tsgo/pkg/tspath"
+	"github.com/startracex/tsgo/pkg/vfs/vfstest"
+)
+
+func TestEmitStopsWritingOnCancellation(t *testing.T) {
+	t.Parallel()
+	fs := vfstest.FromMap(map[string]string{
+		"/src/a.ts":	"export const a = 1;",
+		"/src/b.ts":	"export const b = 2;",
+	}, tspath.CaseSensitive)
+	program, err := compiler.NewProgram(t.Context(), compiler.ProgramOptions{
+		Config: tsoptions.NewParsedCommandLine(
+			&core.CompilerOptions{NoLib: core.TSTrue, Declaration: core.TSTrue, SourceMap: core.TSTrue},
+			testFileNames("/src/a.ts", "/src/b.ts"), nil, "/src", tspath.CaseSensitive,
+		),
+		SingleThreaded:	core.TSTrue,
+		Host:		compiler.NewCompilerHost(fs, "/", nil, nil, nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	writes := 0
+	result := program.Emit(ctx, compiler.EmitOptions{
+		WriteFile: func(fileName tspath.RootedFilePath, text string, data *compiler.WriteFileData) error {
+			writes++
+			cancel()
+			return nil
+		},
+	})
+	if writes != 1 {
+		t.Fatalf("wrote %d files after cancellation; want 1", writes)
+	}
+	if result != nil {
+		t.Fatal("cancelled emit returned a completed result")
+	}
+}
+
+// generateLongLineTS generates TypeScript source code that produces a single very long line.
+// This simulates generated code (e.g., from code generators) that has no line breaks,
+// which triggers O(n²) behavior in source map generation due to
+// GetECMALineAndUTF16CharacterOfPosition scanning from line start for each position.
+func generateLongLineTS(numProperties int) string {
+	// Build a large object literal all on one line, with no line breaks.
+	var b strings.Builder
+	b.WriteString("export const data: Record<string, number> = {")
+	for i := range numProperties {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "prop_%d: %d", i, i)
+	}
+	b.WriteString("};")
+	return b.String()
+}
+
+func BenchmarkEmitLongLines(b *testing.B) {
+	if !bundled.Embedded {
+		b.Skip("bundled files are not embedded")
+	}
+
+	for _, numProps := range []int{1000, 5000, 10000} {
+		b.Run(fmt.Sprintf("props_%d", numProps), func(b *testing.B) {
+			source := generateLongLineTS(numProps)
+
+			fs := vfstest.FromMap(map[string]string{
+				"/dev/src/index.ts": source,
+			}, tspath.CaseSensitive /*caseSensitivity*/)
+			fs = bundled.WrapFS(fs)
+
+			opts := core.CompilerOptions{
+				Target:		core.ScriptTargetES2015,
+				SourceMap:	core.TSTrue,
+				OutDir:		"/dev/out",
+			}
+
+			host := compiler.NewCompilerHost(fs, bundled.LibPath(), nil, nil, nil)
+
+			p, err := compiler.NewProgram(b.Context(), compiler.ProgramOptions{
+				Config:	tsoptions.NewParsedCommandLine(&opts, testFileNames("/dev/src/index.ts"), nil, "/dev/src", fs.CaseSensitivity()),
+				Host:	host,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			// Discard written files — we only care about emit performance.
+			nopWriteFile := func(fileName tspath.RootedFilePath, text string, data *compiler.WriteFileData) error {
+				return nil
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for b.Loop() {
+				p.Emit(context.Background(), compiler.EmitOptions{
+					WriteFile: nopWriteFile,
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkEmitManyFiles(b *testing.B) {
+	if !bundled.Embedded {
+		b.Skip("bundled files are not embedded")
+	}
+
+	// Simulate many files with moderately long single-line content.
+	numFiles := 200
+	numPropsPerFile := 500
+
+	files := make(map[string]string, numFiles)
+	fileNames := make([]string, 0, numFiles)
+	for i := range numFiles {
+		name := fmt.Sprintf("/dev/src/file_%d.ts", i)
+		files[name] = generateLongLineTS(numPropsPerFile)
+		fileNames = append(fileNames, name)
+	}
+
+	fs := vfstest.FromMap(files, tspath.CaseSensitive)
+	fs = bundled.WrapFS(fs)
+
+	opts := core.CompilerOptions{
+		Target:		core.ScriptTargetES2015,
+		SourceMap:	core.TSTrue,
+		OutDir:		"/dev/out",
+	}
+
+	host := compiler.NewCompilerHost(fs, bundled.LibPath(), nil, nil, nil)
+
+	p, err := compiler.NewProgram(b.Context(), compiler.ProgramOptions{
+		Config:	tsoptions.NewParsedCommandLine(&opts, testFileNames(fileNames...), nil, "/dev/src", fs.CaseSensitivity()),
+		Host:	host,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	nopWriteFile := func(fileName tspath.RootedFilePath, text string, data *compiler.WriteFileData) error {
+		return nil
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for b.Loop() {
+		p.Emit(context.Background(), compiler.EmitOptions{
+			WriteFile: nopWriteFile,
+		})
+	}
+}
+
+// BenchmarkEmitLongLinesWithLineBreaks is a control benchmark that emits the same amount
+// of code but WITH line breaks, showing that the issue is specific to long lines.
+func BenchmarkEmitLongLinesWithLineBreaks(b *testing.B) {
+	if !bundled.Embedded {
+		b.Skip("bundled files are not embedded")
+	}
+
+	numProperties := 10000
+
+	// Same content but with newlines between each property.
+	var sb strings.Builder
+	sb.WriteString("export const data: Record<string, number> = {\n")
+	for i := range numProperties {
+		if i > 0 {
+			sb.WriteString(",\n")
+		}
+		fmt.Fprintf(&sb, "  prop_%d: %d", i, i)
+	}
+	sb.WriteString("\n};\n")
+	source := sb.String()
+
+	fs := vfstest.FromMap(map[string]string{
+		"/dev/src/index.ts": source,
+	}, tspath.CaseSensitive)
+	fs = bundled.WrapFS(fs)
+
+	opts := core.CompilerOptions{
+		Target:		core.ScriptTargetES2015,
+		SourceMap:	core.TSTrue,
+		OutDir:		"/dev/out",
+	}
+
+	host := compiler.NewCompilerHost(fs, bundled.LibPath(), nil, nil, nil)
+
+	p, err := compiler.NewProgram(b.Context(), compiler.ProgramOptions{
+		Config:	tsoptions.NewParsedCommandLine(&opts, testFileNames("/dev/src/index.ts"), nil, "/dev/src", fs.CaseSensitivity()),
+		Host:	host,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	nopWriteFile := func(fileName tspath.RootedFilePath, text string, data *compiler.WriteFileData) error {
+		return nil
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for b.Loop() {
+		p.Emit(context.Background(), compiler.EmitOptions{
+			WriteFile: nopWriteFile,
+		})
+	}
+}
